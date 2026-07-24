@@ -58,4 +58,45 @@ describe('TransactionsService', () => {
 
     expect(result).toEqual({ items, total: 42, page: 2, limit: 2 });
   });
+
+  it('filters by type alone, with no walletId, across all wallets', async () => {
+    const execMock = jest.fn().mockResolvedValue([]);
+    transactionModel.find.mockReturnValue({
+      sort: jest.fn().mockReturnThis(),
+      skip: jest.fn().mockReturnThis(),
+      limit: jest.fn().mockReturnThis(),
+      exec: execMock,
+    });
+    transactionModel.countDocuments.mockResolvedValue(0);
+
+    await service.findAll({ type: TransactionType.WITHDRAWAL, page: 1, limit: 20 });
+
+    expect(transactionModel.find).toHaveBeenCalledWith({ type: TransactionType.WITHDRAWAL });
+    expect(transactionModel.countDocuments).toHaveBeenCalledWith({
+      type: TransactionType.WITHDRAWAL,
+    });
+  });
+
+  it('combines walletId and type filters when both are supplied', async () => {
+    const execMock = jest.fn().mockResolvedValue([]);
+    transactionModel.find.mockReturnValue({
+      sort: jest.fn().mockReturnThis(),
+      skip: jest.fn().mockReturnThis(),
+      limit: jest.fn().mockReturnThis(),
+      exec: execMock,
+    });
+    transactionModel.countDocuments.mockResolvedValue(0);
+
+    await service.findAll({
+      walletId: 'wallet-1',
+      type: TransactionType.DEPOSIT,
+      page: 1,
+      limit: 20,
+    });
+
+    expect(transactionModel.find).toHaveBeenCalledWith({
+      walletId: 'wallet-1',
+      type: TransactionType.DEPOSIT,
+    });
+  });
 });

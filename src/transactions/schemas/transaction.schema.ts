@@ -53,3 +53,8 @@ export class Transaction {
 export const TransactionSchema = SchemaFactory.createForClass(Transaction);
 
 TransactionSchema.index({ walletId: 1, createdAt: -1 });
+
+// Supports a `type`-only filter (no walletId) - QueryTransactionsDto allows
+// querying by type across all wallets, which the walletId-prefixed index
+// above can't serve; without this it's a full collection scan.
+TransactionSchema.index({ type: 1, createdAt: -1 });
