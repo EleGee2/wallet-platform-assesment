@@ -5,6 +5,7 @@ import * as bcrypt from 'bcrypt';
 import { Connection } from 'mongoose';
 import request from 'supertest';
 import { AppModule } from '../../src/app.module';
+import { RedisService } from '../../src/redis/redis.service';
 
 // These integration tests exercise the real Mongo/Redis/RabbitMQ stack started by
 // `docker-compose up -d mongo redis rabbitmq`. They are skipped implicitly if those
@@ -30,6 +31,15 @@ export async function createTestApp() {
 export async function resetDatabase(connection: Connection) {
   const collections = await connection.db!.collections();
   await Promise.all(collections.map((collection) => collection.deleteMany({})));
+}
+
+// Rate-limit counters live in the same real, shared Redis instance across
+// every integration spec file (unlike Mongo, which resetDatabase wipes per
+// file) - a route hit from more than one file (e.g. POST /wallets/transfer,
+// used by both transfer-flow and rate-limiting specs) would otherwise
+// accumulate against the same throttle key across files/runs.
+export async function flushThrottleState(app: INestApplication) {
+  await app.get(RedisService).getClient().flushdb();
 }
 
 // Fetches the real Mongoose model bound to the running app, so lookups get
