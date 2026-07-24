@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import * as amqp from 'amqp-connection-manager';
 import { ChannelWrapper } from 'amqp-connection-manager';
 import { ConfirmChannel } from 'amqplib';
+import { v4 as uuidv4 } from 'uuid';
 
 @Injectable()
 export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
@@ -11,10 +12,14 @@ export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
   private channelWrapper: ChannelWrapper;
   private readonly exchange: string;
   private readonly transferQueue: string;
+  private readonly deadLetterExchange: string;
+  private readonly deadLetterQueue: string;
 
   constructor(private readonly configService: ConfigService) {
     this.exchange = this.configService.getOrThrow<string>('rabbitmq.exchange');
     this.transferQueue = this.configService.getOrThrow<string>('rabbitmq.transferQueue');
+    this.deadLetterExchange = this.configService.getOrThrow<string>('rabbitmq.deadLetterExchange');
+    this.deadLetterQueue = this.configService.getOrThrow<string>('rabbitmq.deadLetterQueue');
   }
 
   async onModuleInit() {
@@ -29,7 +34,16 @@ export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
       setup: (channel: ConfirmChannel) =>
         Promise.all([
           channel.assertExchange(this.exchange, 'topic', { durable: true }),
-          channel.assertQueue(this.transferQueue, { durable: true }),
+          // Fanout: everything dead-lettered from the transfer queue (nacked
+          // with requeue: false, or expired) lands in the one DLQ regardless
+          // of its original routing key.
+          channel.assertExchange(this.deadLetterExchange, 'fanout', { durable: true }),
+          channel.assertQueue(this.deadLetterQueue, { durable: true }),
+          channel.bindQueue(this.deadLetterQueue, this.deadLetterExchange, ''),
+          channel.assertQueue(this.transferQueue, {
+            durable: true,
+            arguments: { 'x-dead-letter-exchange': this.deadLetterExchange },
+          }),
           channel.bindQueue(this.transferQueue, this.exchange, 'transfer.*'),
         ]),
     });
@@ -40,8 +54,17 @@ export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
     payload: Record<string, unknown>,
     correlationId?: string,
   ): Promise<void> {
+    // Minted fresh on every call, not passed in: this marks "this specific
+    // delivery attempt", not "this business entity". A real broker
+    // redelivery of the same in-flight message reuses the same properties
+    // (same messageId), while a genuinely new publish() call (a sweep
+    // republish, a retried outbox relay) is a new delivery attempt and
+    // correctly gets a new one - see InboxMessage/transfer-events.consumer.ts.
+    const messageId = uuidv4();
+
     await this.channelWrapper.publish(this.exchange, routingKey, payload, {
       persistent: true,
+      messageId,
       // A real AMQP 0-9-1 message property, not a custom header - lets a
       // consumer recover the id of whatever originated this event.
       ...(correlationId ? { correlationId } : {}),
@@ -57,6 +80,10 @@ export class RabbitMQService implements OnModuleInit, OnModuleDestroy {
 
   getTransferQueue(): string {
     return this.transferQueue;
+  }
+
+  getDeadLetterQueue(): string {
+    return this.deadLetterQueue;
   }
 
   async onModuleDestroy() {
