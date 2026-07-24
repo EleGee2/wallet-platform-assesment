@@ -86,10 +86,12 @@ src/
   in the same MongoDB transaction as the wallet document.
 - `POST /wallets/:id/deposit` / `POST /wallets/:id/withdraw` update the
   wallet balance and record a matching transaction + ledger entry.
-- `POST /wallets/transfer` moves money between two wallets. It debits the
-  sending wallet, records the transaction/ledger entry, and publishes a
-  `transfer.initiated` event to RabbitMQ so the receiving side can be
-  credited asynchronously.
+- `POST /wallets/transfer` moves money between two wallets. In one MongoDB
+  transaction, it debits the sending wallet (an idempotency key on the
+  request is checked first - a retry with the same key returns the original
+  transfer instead of debiting again), records the transaction/ledger entry,
+  and stages a `transfer.initiated` outbox event, so the receiving side can
+  be credited asynchronously once `OutboxRelayWorker` publishes it.
 - `GET /wallets/:id` reads through Redis, falling back to MongoDB.
 - `GET /wallets/:id/dashboard` returns a wallet summary alongside its
   transaction and ledger history.
@@ -114,13 +116,16 @@ to RabbitMQ via `RabbitMQService`, and marks them `PUBLISHED`.
 `RabbitMQService` owns a single `amqp-connection-manager` connection and
 channel, declares the `wallet.events` topic exchange and the
 `transfer.events.queue` queue (bound to `transfer.*`), and exposes a
-`publish(routingKey, payload)` method used by both the outbox relay worker
-and `WalletsService.transfer`.
+`publish(routingKey, payload)` method used by `OutboxRelayWorker` to deliver
+staged events, including `wallet.created` and `transfer.initiated`.
 
 `TransferEventsConsumer` subscribes to `transfer.events.queue` on startup and,
-for each `transfer.initiated` message, credits the destination wallet,
-records the corresponding transaction/ledger entry, and marks the transfer
-`COMPLETED`.
+for each `transfer.initiated` message, atomically claims the transfer (an
+update conditioned on its status still being `PENDING`, inside a MongoDB
+transaction alongside the destination wallet credit and the transaction/ledger
+entry) before marking it `COMPLETED` - so a redelivered or duplicate message
+is a safe no-op rather than a second credit. A processing failure `nack`s the
+message for one redelivery before it's dropped (no dead-letter queue yet).
 
 ### Workers
 
@@ -128,7 +133,10 @@ Three interval-based workers run inside the API process:
 
 - `OutboxRelayWorker` - drains pending outbox events to RabbitMQ.
 - `PendingTransferWorker` - periodically scans for transfers that have been
-  `PENDING` past a configurable timeout.
+  `PENDING` past a configurable timeout and re-publishes `transfer.initiated`
+  for each, self-healing transfers whose original event was lost or never
+  processed (safe to repeat, since the consumer's status guard makes
+  re-processing an already-completed transfer a no-op).
 - `WalletEventsWorker` - periodically logs a balance snapshot for the most
   recently updated wallets, for downstream monitoring dashboards.
 
