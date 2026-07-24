@@ -30,3 +30,11 @@ export class LedgerEntry {
 }
 
 export const LedgerEntrySchema = SchemaFactory.createForClass(LedgerEntry);
+
+// Supports getEntriesForWallet/computeBalanceFromLedger/aggregateNetByWallet,
+// all of which filter (and the first also sorts) on walletId - without this,
+// every one of them is a full collection scan.
+LedgerEntrySchema.index({ walletId: 1, createdAt: 1 });
+
+// Supports the dashboard's batched ledger lookup (`transactionId: { $in: [...] }`).
+LedgerEntrySchema.index({ transactionId: 1 });
