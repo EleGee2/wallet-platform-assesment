@@ -3,6 +3,8 @@ import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
 import { MiddlewareConsumer, NestModule } from '@nestjs/common';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { ThrottlerStorageRedisService } from '@nest-lab/throttler-storage-redis';
 import { AuthModule } from './auth/auth.module';
 import { JwtAuthGuard } from './auth/guards/jwt-auth.guard';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
@@ -14,6 +16,7 @@ import { LedgerModule } from './ledger/ledger.module';
 import { OutboxModule } from './outbox/outbox.module';
 import { QueueModule } from './queue/queue.module';
 import { RedisModule } from './redis/redis.module';
+import { RedisService } from './redis/redis.service';
 import { TransactionsModule } from './transactions/transactions.module';
 import { WalletsModule } from './wallets/wallets.module';
 import { WorkersModule } from './workers/workers.module';
@@ -29,6 +32,24 @@ import { WorkersModule } from './workers/workers.module';
       }),
     }),
     RedisModule,
+    ThrottlerModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService, RedisService],
+      useFactory: (configService: ConfigService, redisService: RedisService) => ({
+        throttlers: [
+          {
+            name: 'default',
+            ttl: configService.getOrThrow<number>('rateLimit.ttlMs'),
+            limit: configService.getOrThrow<number>('rateLimit.limit'),
+          },
+        ],
+        // Redis-backed (reusing the existing connection) rather than the
+        // default in-memory store - process-local state would silently
+        // reset on every restart and wouldn't work at all across more than
+        // one instance.
+        storage: new ThrottlerStorageRedisService(redisService.getClient()),
+      }),
+    }),
     AuthModule,
     HealthModule,
     WalletsModule,
@@ -39,6 +60,7 @@ import { WorkersModule } from './workers/workers.module';
     WorkersModule,
   ],
   providers: [
+    { provide: APP_GUARD, useClass: ThrottlerGuard },
     { provide: APP_GUARD, useClass: JwtAuthGuard },
     { provide: APP_FILTER, useClass: AllExceptionsFilter },
     { provide: APP_INTERCEPTOR, useClass: LoggingInterceptor },

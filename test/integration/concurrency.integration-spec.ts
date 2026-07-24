@@ -1,7 +1,13 @@
 import { INestApplication } from '@nestjs/common';
 import { Connection } from 'mongoose';
 import { Wallet } from '../../src/wallets/schemas/wallet.schema';
-import { createAuthenticatedRequest, createTestApp, getModel, resetDatabase } from './test-utils';
+import {
+  createAuthenticatedRequest,
+  createTestApp,
+  flushThrottleState,
+  getModel,
+  resetDatabase,
+} from './test-utils';
 
 describe('Concurrent wallet operations (integration)', () => {
   let app: INestApplication;
@@ -14,6 +20,7 @@ describe('Concurrent wallet operations (integration)', () => {
 
   beforeEach(async () => {
     await resetDatabase(connection);
+    await flushThrottleState(app);
     client = await createAuthenticatedRequest(app, connection);
   });
 
