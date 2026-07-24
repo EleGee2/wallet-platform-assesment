@@ -34,7 +34,10 @@ export class Transaction {
   balanceAfter?: number;
 
   // Idempotency key supplied by the caller, or derived for internally generated transactions.
-  @Prop({ index: true })
+  // Unique + sparse: enforces at-most-one transaction per reference at the database
+  // level (the real concurrency backstop for retried requests), while allowing any
+  // number of transactions that don't supply one.
+  @Prop({ unique: true, sparse: true })
   reference?: string;
 
   @Prop({ type: MongooseSchema.Types.ObjectId, ref: 'Transfer' })

@@ -71,7 +71,8 @@ export class TransactionsService {
     return { items, total, page, limit };
   }
 
-  async findByReference(reference: string) {
-    return this.transactionModel.findOne({ reference }).exec();
+  async findByReference(reference: string, session?: ClientSession) {
+    const query = this.transactionModel.findOne({ reference });
+    return session ? query.session(session).exec() : query.exec();
   }
 }
