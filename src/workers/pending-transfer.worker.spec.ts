@@ -1,23 +1,37 @@
 import { ConfigService } from '@nestjs/config';
-import { getModelToken } from '@nestjs/mongoose';
+import { getConnectionToken, getModelToken } from '@nestjs/mongoose';
 import { Test, TestingModule } from '@nestjs/testing';
 import { Types } from 'mongoose';
-import { RabbitMQService } from '../queue/rabbitmq.service';
+import { getCorrelationId } from '../common/context/request-context';
+import { OutboxService } from '../outbox/outbox.service';
 import { Transfer } from '../wallets/schemas/transfer.schema';
 import { PendingTransferWorker } from './pending-transfer.worker';
 
 describe('PendingTransferWorker', () => {
   let worker: PendingTransferWorker;
   let transferModel: any;
-  let rabbitMQService: any;
+  let outboxService: any;
+  let connection: any;
+
+  function mockNormalSession() {
+    return {
+      withTransaction: jest.fn(async (fn: () => Promise<unknown>) => fn()),
+      endSession: jest.fn(),
+    };
+  }
 
   beforeEach(async () => {
-    transferModel = { find: jest.fn(), updateMany: jest.fn().mockResolvedValue(undefined) };
-    rabbitMQService = { publish: jest.fn() };
+    transferModel = {
+      find: jest.fn(),
+      updateOne: jest.fn().mockResolvedValue({ matchedCount: 1 }),
+    };
+    outboxService = { enqueue: jest.fn() };
+    connection = { startSession: jest.fn().mockImplementation(async () => mockNormalSession()) };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         PendingTransferWorker,
+        { provide: getConnectionToken(), useValue: connection },
         { provide: getModelToken(Transfer.name), useValue: transferModel },
         {
           provide: ConfigService,
@@ -29,7 +43,7 @@ describe('PendingTransferWorker', () => {
             }),
           },
         },
-        { provide: RabbitMQService, useValue: rabbitMQService },
+        { provide: OutboxService, useValue: outboxService },
       ],
     }).compile();
 
@@ -72,13 +86,18 @@ describe('PendingTransferWorker', () => {
     expect(limit).toHaveBeenCalledWith(100);
   });
 
-  it('re-publishes transfer.initiated for each stale PENDING transfer, reconstructed from its own fields', async () => {
+  it('atomically marks a stale transfer swept and stages its republish in the outbox', async () => {
     const staleTransfer = makeTransfer({ amount: 42 });
     mockFind([staleTransfer]);
 
     await (worker as any).sweep();
 
-    expect(rabbitMQService.publish).toHaveBeenCalledWith(
+    expect(transferModel.updateOne).toHaveBeenCalledWith(
+      { _id: staleTransfer._id, status: 'PENDING' },
+      { $set: { lastSweptAt: expect.any(Date) } },
+      { session: expect.anything() },
+    );
+    expect(outboxService.enqueue).toHaveBeenCalledWith(
       'transfer.initiated',
       {
         transferId: staleTransfer.id,
@@ -86,43 +105,32 @@ describe('PendingTransferWorker', () => {
         toWalletId: staleTransfer.toWalletId.toString(),
         amount: 42,
       },
-      undefined,
+      expect.anything(),
     );
   });
 
-  it('propagates the originating correlation id when the stale transfer has one stored', async () => {
+  it('propagates the originating correlation id via the ambient request context', async () => {
     const staleTransfer = makeTransfer({ correlationId: 'corr-stuck-1' });
     mockFind([staleTransfer]);
 
+    let capturedDuringEnqueue: string | undefined;
+    outboxService.enqueue.mockImplementation(async () => {
+      capturedDuringEnqueue = getCorrelationId();
+    });
+
     await (worker as any).sweep();
 
-    expect(rabbitMQService.publish).toHaveBeenCalledWith(
-      'transfer.initiated',
-      expect.any(Object),
-      'corr-stuck-1',
-    );
+    expect(capturedDuringEnqueue).toBe('corr-stuck-1');
   });
 
-  it('marks the whole batch as swept before attempting any publish', async () => {
-    const first = makeTransfer();
-    const second = makeTransfer();
-    mockFind([first, second]);
-
-    const callOrder: string[] = [];
-    transferModel.updateMany.mockImplementation(async () => {
-      callOrder.push('updateMany');
-    });
-    rabbitMQService.publish.mockImplementation(async () => {
-      callOrder.push('publish');
-    });
+  it('skips staging a republish when the transfer was no longer PENDING at update time', async () => {
+    const staleTransfer = makeTransfer();
+    mockFind([staleTransfer]);
+    transferModel.updateOne.mockResolvedValueOnce({ matchedCount: 0 });
 
     await (worker as any).sweep();
 
-    expect(transferModel.updateMany).toHaveBeenCalledWith(
-      { _id: { $in: [first._id, second._id] } },
-      { $set: { lastSweptAt: expect.any(Date) } },
-    );
-    expect(callOrder).toEqual(['updateMany', 'publish', 'publish']);
+    expect(outboxService.enqueue).not.toHaveBeenCalled();
   });
 
   it('is a no-op when nothing is stale', async () => {
@@ -130,19 +138,24 @@ describe('PendingTransferWorker', () => {
 
     await (worker as any).sweep();
 
-    expect(transferModel.updateMany).not.toHaveBeenCalled();
-    expect(rabbitMQService.publish).not.toHaveBeenCalled();
+    expect(transferModel.updateOne).not.toHaveBeenCalled();
+    expect(outboxService.enqueue).not.toHaveBeenCalled();
   });
 
-  it('keeps processing the rest when one republish fails', async () => {
+  it('keeps processing the rest when one transfer fails to stage', async () => {
     const first = makeTransfer();
     const second = makeTransfer();
     mockFind([first, second]);
-    rabbitMQService.publish.mockRejectedValueOnce(new Error('broker unreachable'));
-    rabbitMQService.publish.mockResolvedValueOnce(undefined);
+
+    connection.startSession
+      .mockImplementationOnce(async () => ({
+        withTransaction: jest.fn().mockRejectedValue(new Error('write conflict')),
+        endSession: jest.fn(),
+      }))
+      .mockImplementationOnce(async () => mockNormalSession());
 
     await (worker as any).sweep();
 
-    expect(rabbitMQService.publish).toHaveBeenCalledTimes(2);
+    expect(outboxService.enqueue).toHaveBeenCalledTimes(1);
   });
 });

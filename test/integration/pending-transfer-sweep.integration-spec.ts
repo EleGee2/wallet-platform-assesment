@@ -1,10 +1,16 @@
 import { INestApplication } from '@nestjs/common';
 import { Connection, Types } from 'mongoose';
-import { RabbitMQService } from '../../src/queue/rabbitmq.service';
+import { OutboxService } from '../../src/outbox/outbox.service';
 import { Transfer } from '../../src/wallets/schemas/transfer.schema';
 import { Wallet } from '../../src/wallets/schemas/wallet.schema';
 import { PendingTransferWorker } from '../../src/workers/pending-transfer.worker';
-import { createAuthenticatedRequest, createTestApp, getModel, resetDatabase } from './test-utils';
+import {
+  createAuthenticatedRequest,
+  createTestApp,
+  flushThrottleState,
+  getModel,
+  resetDatabase,
+} from './test-utils';
 
 async function pollUntil(fn: () => Promise<boolean>, timeoutMs = 8000, intervalMs = 200) {
   const start = Date.now();
@@ -22,19 +28,20 @@ describe('PendingTransferWorker sweep (integration)', () => {
   let connection: Connection;
   let client: Awaited<ReturnType<typeof createAuthenticatedRequest>>;
   let worker: PendingTransferWorker;
-  let rabbitMQService: RabbitMQService;
+  let outboxService: OutboxService;
 
   beforeAll(async () => {
     ({ app, connection } = await createTestApp());
     worker = app.get(PendingTransferWorker);
-    rabbitMQService = app.get(RabbitMQService);
+    outboxService = app.get(OutboxService);
     // The worker's own interval would otherwise race with the manual sweep()
-    // calls below and inflate the publish-call assertions non-deterministically.
+    // calls below and inflate the enqueue-call assertions non-deterministically.
     clearInterval((worker as any).timer);
   });
 
   beforeEach(async () => {
     await resetDatabase(connection);
+    await flushThrottleState(app);
     client = await createAuthenticatedRequest(app, connection);
   });
 
@@ -45,7 +52,6 @@ describe('PendingTransferWorker sweep (integration)', () => {
   it('re-publishes a stale transfer at most once per timeout window, and it still completes normally', async () => {
     const walletModel = getModel(app, Wallet.name);
     const transferModel = getModel(app, Transfer.name);
-    const publishSpy = jest.spyOn(rabbitMQService, 'publish');
 
     const fromWallet = await client
       .post('/wallets')
@@ -71,13 +77,17 @@ describe('PendingTransferWorker sweep (integration)', () => {
       updatedAt: new Date(Date.now() - 61_000),
     });
 
+    // Set up after the wallet/deposit calls above, which stage their own
+    // (unrelated) wallet.created outbox events via the same enqueue() method.
+    const enqueueSpy = jest.spyOn(outboxService, 'enqueue');
+
     await (worker as any).sweep();
-    expect(publishSpy).toHaveBeenCalledTimes(1);
+    expect(enqueueSpy).toHaveBeenCalledTimes(1);
 
     // Immediately swept again, before the consumer has necessarily finished
     // processing the first publish - lastSweptAt (just set) must exclude it.
     await (worker as any).sweep();
-    expect(publishSpy).toHaveBeenCalledTimes(1);
+    expect(enqueueSpy).toHaveBeenCalledTimes(1);
 
     const settled = await pollUntil(async () => {
       const transfer = await transferModel.findById(transferId);
