@@ -1,8 +1,10 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { ConsumeMessage } from 'amqplib';
-import { Model } from 'mongoose';
+import { InjectConnection, InjectModel } from '@nestjs/mongoose';
+import type { Channel, ConfirmChannel, ConsumeMessage } from 'amqplib';
+import { Connection, Model } from 'mongoose';
+import { getCorrelationId, requestContext } from '../common/context/request-context';
 import { LedgerService } from '../ledger/ledger.service';
+import { RedisService } from '../redis/redis.service';
 import {
   Transaction,
   TransactionDocument,
@@ -26,75 +28,138 @@ export class TransferEventsConsumer implements OnModuleInit {
 
   constructor(
     private readonly rabbitMQService: RabbitMQService,
+    @InjectConnection() private readonly connection: Connection,
     @InjectModel(Transfer.name) private readonly transferModel: Model<TransferDocument>,
     @InjectModel(Wallet.name) private readonly walletModel: Model<WalletDocument>,
     @InjectModel(Transaction.name)
     private readonly transactionModel: Model<TransactionDocument>,
     private readonly ledgerService: LedgerService,
+    private readonly redisService: RedisService,
   ) {}
 
   onModuleInit() {
     const channelWrapper = this.rabbitMQService.getChannelWrapper();
     const queue = this.rabbitMQService.getTransferQueue();
 
-    channelWrapper.addSetup((channel) =>
+    channelWrapper.addSetup((channel: ConfirmChannel) =>
       channel.consume(queue, (message) => this.handleMessage(message, channel)),
     );
   }
 
-  private async handleMessage(message: ConsumeMessage | null, channel: any) {
+  private async handleMessage(message: ConsumeMessage | null, channel: Channel) {
     if (!message) {
       return;
     }
 
-    try {
-      const event: TransferInitiatedEvent = JSON.parse(message.content.toString());
-      await this.completeTransfer(event);
-      channel.ack(message);
-    } catch (error) {
-      this.logger.error(`Failed to process transfer event: ${(error as Error).message}`);
-      channel.ack(message);
-    }
+    // Re-establishes the originating HTTP request's context on the consuming
+    // side (the message carries it as a real AMQP correlationId property, set
+    // by whichever publish path produced it), so every log line during
+    // processing traces back to it.
+    const correlationId = message.properties?.correlationId as string | undefined;
+
+    await requestContext.run({ correlationId }, async () => {
+      let event: TransferInitiatedEvent | undefined;
+      try {
+        event = JSON.parse(message.content.toString());
+        await this.completeTransfer(event!);
+        channel.ack(message);
+      } catch (error) {
+        const alreadyRetried = message.fields.redelivered;
+        this.logger.error(
+          `[${getCorrelationId() ?? '-'}] Failed to process transfer event` +
+            `${event ? ` for transfer ${event.transferId}` : ''} ` +
+            `(redelivered=${alreadyRetried}): ${(error as Error).message}`,
+        );
+
+        // No dead-letter queue exists yet (a bonus/optional item, not built here).
+        // Bound the blast radius of a transient or poison message to one
+        // redelivery, using RabbitMQ's own `redelivered` flag, instead of the
+        // previous behavior of unconditionally acking (silently dropping) it.
+        if (alreadyRetried) {
+          this.logger.error(
+            `[${getCorrelationId() ?? '-'}] Dropping transfer event` +
+              `${event ? ` for transfer ${event.transferId}` : ''} ` +
+              'after exhausting its one retry - requires manual investigation',
+          );
+          channel.nack(message, false, false);
+        } else {
+          channel.nack(message, false, true);
+        }
+      }
+    });
   }
 
   private async completeTransfer(event: TransferInitiatedEvent) {
-    const transfer = await this.transferModel.findById(event.transferId);
-    if (!transfer) {
-      this.logger.warn(`Transfer ${event.transferId} not found, skipping`);
-      return;
+    const session = await this.connection.startSession();
+
+    try {
+      await session.withTransaction(async () => {
+        // Atomic, status-guarded claim: only one execution of this - across
+        // redeliveries, duplicate messages, or the sweep worker's republish -
+        // will ever see status flip PENDING -> COMPLETED. A null result means
+        // "already handled or doesn't exist", a safe no-op either way.
+        const transfer = await this.transferModel.findOneAndUpdate(
+          { _id: event.transferId, status: TransferStatus.PENDING },
+          { status: TransferStatus.COMPLETED },
+          { new: true, session },
+        );
+
+        if (!transfer) {
+          this.logger.warn(
+            `[${getCorrelationId() ?? '-'}] Transfer ${event.transferId} not pending, ` +
+              'skipping (already processed or missing)',
+          );
+          return;
+        }
+
+        const toWallet = await this.walletModel.findOneAndUpdate(
+          { _id: event.toWalletId },
+          { $inc: { balance: event.amount } },
+          { new: true, session },
+        );
+
+        if (!toWallet) {
+          // Structurally shouldn't happen (wallets aren't deleted), but if it
+          // does, abort so the status flip above rolls back too - the transfer
+          // stays honestly PENDING for a retry to pick up, instead of COMPLETED
+          // with no matching credit.
+          throw new Error(`Destination wallet ${event.toWalletId} not found`);
+        }
+
+        const [creditTransaction] = await this.transactionModel.create(
+          [
+            {
+              walletId: toWallet._id,
+              type: TransactionType.TRANSFER_IN,
+              amount: event.amount,
+              status: TransactionStatus.COMPLETED,
+              balanceAfter: toWallet.balance,
+              transferId: transfer._id,
+              counterpartyWalletId: transfer.fromWalletId,
+            },
+          ],
+          { session },
+        );
+
+        await this.ledgerService.recordCredit(
+          toWallet._id,
+          creditTransaction._id,
+          event.amount,
+          toWallet.balance,
+          session,
+        );
+
+        this.logger.log(
+          `[${getCorrelationId() ?? '-'}] Transfer ${transfer.id} completed for wallet ${toWallet.id}`,
+        );
+      });
+    } finally {
+      await session.endSession();
     }
 
-    const toWallet = await this.walletModel.findById(event.toWalletId);
-    if (!toWallet) {
-      this.logger.warn(`Destination wallet ${event.toWalletId} not found, skipping`);
-      return;
-    }
-
-    toWallet.balance += event.amount;
-    await toWallet.save();
-
-    const [creditTransaction] = await this.transactionModel.create([
-      {
-        walletId: toWallet._id,
-        type: TransactionType.TRANSFER_IN,
-        amount: event.amount,
-        status: TransactionStatus.COMPLETED,
-        balanceAfter: toWallet.balance,
-        transferId: transfer._id,
-        counterpartyWalletId: transfer.fromWalletId,
-      },
-    ]);
-
-    await this.ledgerService.recordCredit(
-      toWallet._id,
-      creditTransaction._id,
-      event.amount,
-      toWallet.balance,
-    );
-
-    transfer.status = TransferStatus.COMPLETED;
-    await transfer.save();
-
-    this.logger.log(`Transfer ${transfer.id} completed for wallet ${toWallet.id}`);
+    // Unconditional and outside the transaction: safe even on a no-op
+    // redelivery (the original successful delivery already invalidated this
+    // key - a redundant invalidation here is harmless).
+    await this.redisService.invalidateBalance(event.toWalletId);
   }
 }
