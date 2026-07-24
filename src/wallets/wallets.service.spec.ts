@@ -52,9 +52,14 @@ describe('WalletsService', () => {
     };
     ledgerEntryModel = {
       find: jest.fn(),
+      countDocuments: jest.fn(),
     };
     transactionsService = { create: jest.fn(), findByReference: jest.fn() };
-    ledgerService = { recordCredit: jest.fn(), recordDebit: jest.fn() };
+    ledgerService = {
+      recordCredit: jest.fn(),
+      recordDebit: jest.fn(),
+      aggregateNetByWallet: jest.fn(),
+    };
     outboxService = { enqueue: jest.fn() };
     redisService = {
       getCachedBalance: jest.fn(),
@@ -569,6 +574,123 @@ describe('WalletsService', () => {
 
       expect(result.transactionCount).toBe(37);
       expect(result.recentActivity).toHaveLength(10);
+    });
+  });
+
+  describe('reconcileWallet', () => {
+    function mockWalletLookup(wallet: unknown) {
+      walletModel.findById.mockReturnValue({
+        lean: () => ({ exec: () => Promise.resolve(wallet) }),
+      });
+    }
+
+    it('reports reconciled when the stored balance matches the ledger-derived total', async () => {
+      const walletId = new Types.ObjectId().toString();
+      mockWalletLookup({ _id: walletId, balance: 500 });
+      ledgerService.aggregateNetByWallet.mockResolvedValue(500);
+
+      const result = await service.reconcileWallet(walletId);
+
+      expect(ledgerService.aggregateNetByWallet).toHaveBeenCalledWith(walletId);
+      expect(result).toEqual({
+        walletId,
+        storedBalance: 500,
+        ledgerBalance: 500,
+        drift: 0,
+        reconciled: true,
+      });
+    });
+
+    it('reports the signed drift when the stored balance disagrees with the ledger', async () => {
+      const walletId = new Types.ObjectId().toString();
+      mockWalletLookup({ _id: walletId, balance: 550 });
+      ledgerService.aggregateNetByWallet.mockResolvedValue(500);
+
+      const result = await service.reconcileWallet(walletId);
+
+      expect(result).toEqual({
+        walletId,
+        storedBalance: 550,
+        ledgerBalance: 500,
+        drift: 50,
+        reconciled: false,
+      });
+    });
+
+    it('throws NotFoundException when the wallet does not exist', async () => {
+      mockWalletLookup(null);
+
+      await expect(service.reconcileWallet('missing-wallet')).rejects.toThrow(NotFoundException);
+      expect(ledgerService.aggregateNetByWallet).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getAudit', () => {
+    function mockWalletLookup(wallet: unknown) {
+      walletModel.findById.mockReturnValue({
+        lean: () => ({ exec: () => Promise.resolve(wallet) }),
+      });
+    }
+
+    function mockEntries(entries: unknown[]) {
+      const exec = jest.fn().mockResolvedValue(entries);
+      const lean = jest.fn().mockReturnValue({ exec });
+      const limit = jest.fn().mockReturnValue({ lean });
+      const skip = jest.fn().mockReturnValue({ limit });
+      const sort = jest.fn().mockReturnValue({ skip });
+      ledgerEntryModel.find.mockReturnValue({ sort });
+      return { sort, skip, limit };
+    }
+
+    it('paginates ledger entries newest-first and reports the total count', async () => {
+      const walletId = new Types.ObjectId().toString();
+      mockWalletLookup({ _id: walletId });
+      const entries = [{ direction: 'CREDIT', amount: 100, balanceAfter: 100 }];
+      const { sort, skip, limit } = mockEntries(entries);
+      ledgerEntryModel.countDocuments.mockResolvedValue(37);
+
+      const result = await service.getAudit(walletId, { page: 2, limit: 10 });
+
+      expect(ledgerEntryModel.find).toHaveBeenCalledWith({ walletId });
+      expect(sort).toHaveBeenCalledWith({ createdAt: -1 });
+      expect(skip).toHaveBeenCalledWith(10);
+      expect(limit).toHaveBeenCalledWith(10);
+      expect(result).toEqual({ items: entries, total: 37, page: 2, limit: 10 });
+    });
+
+    it('applies the optional direction filter', async () => {
+      const walletId = new Types.ObjectId().toString();
+      mockWalletLookup({ _id: walletId });
+      mockEntries([]);
+      ledgerEntryModel.countDocuments.mockResolvedValue(0);
+
+      await service.getAudit(walletId, { direction: 'DEBIT' as any, page: 1, limit: 20 });
+
+      expect(ledgerEntryModel.find).toHaveBeenCalledWith({ walletId, direction: 'DEBIT' });
+      expect(ledgerEntryModel.countDocuments).toHaveBeenCalledWith({
+        walletId,
+        direction: 'DEBIT',
+      });
+    });
+
+    it('returns an empty page for a wallet with no ledger entries', async () => {
+      const walletId = new Types.ObjectId().toString();
+      mockWalletLookup({ _id: walletId });
+      mockEntries([]);
+      ledgerEntryModel.countDocuments.mockResolvedValue(0);
+
+      const result = await service.getAudit(walletId, { page: 1, limit: 20 });
+
+      expect(result).toEqual({ items: [], total: 0, page: 1, limit: 20 });
+    });
+
+    it('throws NotFoundException when the wallet does not exist', async () => {
+      mockWalletLookup(null);
+
+      await expect(service.getAudit('missing-wallet', { page: 1, limit: 20 })).rejects.toThrow(
+        NotFoundException,
+      );
+      expect(ledgerEntryModel.find).not.toHaveBeenCalled();
     });
   });
 });

@@ -7,6 +7,7 @@ import {
 import { InjectConnection, InjectModel } from '@nestjs/mongoose';
 import { Connection, Model, Types } from 'mongoose';
 import { getCorrelationId } from '../common/context/request-context';
+import { QueryLedgerEntriesDto } from '../ledger/dto/query-ledger-entries.dto';
 import { LedgerEntry, LedgerEntryDocument } from '../ledger/schemas/ledger-entry.schema';
 import { LedgerService } from '../ledger/ledger.service';
 import { OutboxService } from '../outbox/outbox.service';
@@ -92,6 +93,57 @@ export class WalletsService {
 
     await this.redisService.setCachedBalance(id, wallet.balance);
     return wallet;
+  }
+
+  // Compares the wallet's stored, denormalized balance against the balance
+  // derived from its own ledger entries - reads Mongo directly (not the Redis
+  // cache), since reconciliation must check against ground truth.
+  async reconcileWallet(id: string) {
+    const wallet = await this.walletModel.findById(id).lean().exec();
+    if (!wallet) {
+      throw new NotFoundException(`Wallet ${id} not found`);
+    }
+
+    const ledgerBalance = await this.ledgerService.aggregateNetByWallet(id);
+    const drift = wallet.balance - ledgerBalance;
+
+    return {
+      walletId: id,
+      storedBalance: wallet.balance,
+      ledgerBalance,
+      drift,
+      reconciled: drift === 0,
+    };
+  }
+
+  // Ledger-entry-level detail (individual debit/credit legs) - the actual
+  // audit-grade view, one level more granular than the transaction list
+  // TransactionsController already exposes.
+  async getAudit(id: string, query: QueryLedgerEntriesDto) {
+    const wallet = await this.walletModel.findById(id).lean().exec();
+    if (!wallet) {
+      throw new NotFoundException(`Wallet ${id} not found`);
+    }
+
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+    const filter: Record<string, unknown> = { walletId: id };
+    if (query.direction) {
+      filter.direction = query.direction;
+    }
+
+    const [items, total] = await Promise.all([
+      this.ledgerEntryModel
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean()
+        .exec(),
+      this.ledgerEntryModel.countDocuments(filter),
+    ]);
+
+    return { items, total, page, limit };
   }
 
   async deposit(id: string, dto: DepositDto) {
