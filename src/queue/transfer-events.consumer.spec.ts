@@ -7,6 +7,7 @@ import { Transaction, TransactionType } from '../transactions/schemas/transactio
 import { Transfer, TransferStatus } from '../wallets/schemas/transfer.schema';
 import { Wallet } from '../wallets/schemas/wallet.schema';
 import { RabbitMQService } from './rabbitmq.service';
+import { InboxMessage } from './schemas/inbox-message.schema';
 import { TransferEventsConsumer } from './transfer-events.consumer';
 
 describe('TransferEventsConsumer', () => {
@@ -14,6 +15,8 @@ describe('TransferEventsConsumer', () => {
   let transferModel: any;
   let walletModel: any;
   let transactionModel: any;
+  let inboxMessageModel: any;
+  let connection: any;
   let ledgerService: any;
   let redisService: any;
 
@@ -26,6 +29,11 @@ describe('TransferEventsConsumer', () => {
     transferModel = { findOneAndUpdate: jest.fn() };
     walletModel = { findOneAndUpdate: jest.fn() };
     transactionModel = { create: jest.fn() };
+    inboxMessageModel = {
+      exists: jest.fn().mockResolvedValue(false),
+      create: jest.fn().mockResolvedValue(undefined),
+    };
+    connection = { startSession: jest.fn().mockResolvedValue(mockSession) };
     ledgerService = { recordCredit: jest.fn() };
     redisService = { invalidateBalance: jest.fn() };
 
@@ -34,7 +42,7 @@ describe('TransferEventsConsumer', () => {
         TransferEventsConsumer,
         {
           provide: getConnectionToken(),
-          useValue: { startSession: jest.fn().mockResolvedValue(mockSession) },
+          useValue: connection,
         },
         {
           provide: RabbitMQService,
@@ -43,6 +51,7 @@ describe('TransferEventsConsumer', () => {
         { provide: getModelToken(Transfer.name), useValue: transferModel },
         { provide: getModelToken(Wallet.name), useValue: walletModel },
         { provide: getModelToken(Transaction.name), useValue: transactionModel },
+        { provide: getModelToken(InboxMessage.name), useValue: inboxMessageModel },
         { provide: LedgerService, useValue: ledgerService },
         { provide: RedisService, useValue: redisService },
       ],
@@ -171,6 +180,107 @@ describe('TransferEventsConsumer', () => {
 
       expect(transactionModel.create).not.toHaveBeenCalled();
       expect(redisService.invalidateBalance).not.toHaveBeenCalled();
+    });
+
+    it('claims the message id before the transfer status-guard runs', async () => {
+      const transferId = new Types.ObjectId();
+      const callOrder: string[] = [];
+      inboxMessageModel.create.mockImplementation(async () => {
+        callOrder.push('inbox-claim');
+      });
+      transferModel.findOneAndUpdate.mockImplementation(async () => {
+        callOrder.push('transfer-guard');
+        return {
+          _id: transferId,
+          id: transferId.toString(),
+          status: TransferStatus.COMPLETED,
+          fromWalletId: 'wallet-1',
+        };
+      });
+      walletModel.findOneAndUpdate.mockResolvedValue({
+        _id: new Types.ObjectId(),
+        id: 'wallet-2',
+        balance: 125,
+      });
+      transactionModel.create.mockResolvedValue([{ _id: new Types.ObjectId() }]);
+
+      await (consumer as any).completeTransfer(
+        {
+          transferId: transferId.toString(),
+          fromWalletId: 'wallet-1',
+          toWalletId: 'wallet-2',
+          amount: 25,
+        },
+        'msg-1',
+      );
+
+      expect(inboxMessageModel.create).toHaveBeenCalledWith([{ messageId: 'msg-1' }], {
+        session: mockSession,
+      });
+      expect(callOrder).toEqual(['inbox-claim', 'transfer-guard']);
+    });
+
+    it('skips opening a session entirely when the fast pre-check finds the message already processed', async () => {
+      inboxMessageModel.exists.mockResolvedValue(true);
+
+      await (consumer as any).completeTransfer(
+        {
+          transferId: new Types.ObjectId().toString(),
+          fromWalletId: 'wallet-1',
+          toWalletId: 'wallet-2',
+          amount: 25,
+        },
+        'msg-already-seen',
+      );
+
+      expect(inboxMessageModel.exists).toHaveBeenCalledWith({ messageId: 'msg-already-seen' });
+      expect(connection.startSession).not.toHaveBeenCalled();
+      expect(transferModel.findOneAndUpdate).not.toHaveBeenCalled();
+    });
+
+    it('treats a duplicate-key race on the claim insert as a safe no-op', async () => {
+      inboxMessageModel.create.mockRejectedValue({ code: 11000 });
+
+      await expect(
+        (consumer as any).completeTransfer(
+          {
+            transferId: new Types.ObjectId().toString(),
+            fromWalletId: 'wallet-1',
+            toWalletId: 'wallet-2',
+            amount: 25,
+          },
+          'msg-race',
+        ),
+      ).resolves.toBeUndefined();
+
+      expect(transferModel.findOneAndUpdate).not.toHaveBeenCalled();
+    });
+
+    it('processes normally without touching the inbox when no message id is present', async () => {
+      const transferId = new Types.ObjectId();
+      transferModel.findOneAndUpdate.mockResolvedValue({
+        _id: transferId,
+        id: transferId.toString(),
+        status: TransferStatus.COMPLETED,
+        fromWalletId: 'wallet-1',
+      });
+      walletModel.findOneAndUpdate.mockResolvedValue({
+        _id: new Types.ObjectId(),
+        id: 'wallet-2',
+        balance: 125,
+      });
+      transactionModel.create.mockResolvedValue([{ _id: new Types.ObjectId() }]);
+
+      await (consumer as any).completeTransfer({
+        transferId: transferId.toString(),
+        fromWalletId: 'wallet-1',
+        toWalletId: 'wallet-2',
+        amount: 25,
+      });
+
+      expect(inboxMessageModel.exists).not.toHaveBeenCalled();
+      expect(inboxMessageModel.create).not.toHaveBeenCalled();
+      expect(transferModel.findOneAndUpdate).toHaveBeenCalled();
     });
   });
 

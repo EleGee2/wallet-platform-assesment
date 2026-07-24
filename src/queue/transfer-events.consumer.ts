@@ -14,6 +14,7 @@ import {
 import { Transfer, TransferDocument, TransferStatus } from '../wallets/schemas/transfer.schema';
 import { Wallet, WalletDocument } from '../wallets/schemas/wallet.schema';
 import { RabbitMQService } from './rabbitmq.service';
+import { InboxMessage, InboxMessageDocument } from './schemas/inbox-message.schema';
 
 export interface TransferInitiatedEvent {
   transferId: string;
@@ -33,6 +34,8 @@ export class TransferEventsConsumer implements OnModuleInit {
     @InjectModel(Wallet.name) private readonly walletModel: Model<WalletDocument>,
     @InjectModel(Transaction.name)
     private readonly transactionModel: Model<TransactionDocument>,
+    @InjectModel(InboxMessage.name)
+    private readonly inboxMessageModel: Model<InboxMessageDocument>,
     private readonly ledgerService: LedgerService,
     private readonly redisService: RedisService,
   ) {}
@@ -56,12 +59,13 @@ export class TransferEventsConsumer implements OnModuleInit {
     // by whichever publish path produced it), so every log line during
     // processing traces back to it.
     const correlationId = message.properties?.correlationId as string | undefined;
+    const messageId = message.properties?.messageId as string | undefined;
 
     await requestContext.run({ correlationId }, async () => {
       let event: TransferInitiatedEvent | undefined;
       try {
         event = JSON.parse(message.content.toString());
-        await this.completeTransfer(event!);
+        await this.completeTransfer(event!, messageId);
         channel.ack(message);
       } catch (error) {
         const alreadyRetried = message.fields.redelivered;
@@ -71,15 +75,16 @@ export class TransferEventsConsumer implements OnModuleInit {
             `(redelivered=${alreadyRetried}): ${(error as Error).message}`,
         );
 
-        // No dead-letter queue exists yet (a bonus/optional item, not built here).
         // Bound the blast radius of a transient or poison message to one
         // redelivery, using RabbitMQ's own `redelivered` flag, instead of the
         // previous behavior of unconditionally acking (silently dropping) it.
+        // A message that exhausts this retry is dead-lettered (RabbitMQService's
+        // queue topology), not lost - see DESIGN.md.
         if (alreadyRetried) {
           this.logger.error(
             `[${getCorrelationId() ?? '-'}] Dropping transfer event` +
               `${event ? ` for transfer ${event.transferId}` : ''} ` +
-              'after exhausting its one retry - requires manual investigation',
+              'after exhausting its one retry - dead-lettered for investigation',
           );
           channel.nack(message, false, false);
         } else {
@@ -89,11 +94,41 @@ export class TransferEventsConsumer implements OnModuleInit {
     });
   }
 
-  private async completeTransfer(event: TransferInitiatedEvent) {
+  private async completeTransfer(event: TransferInitiatedEvent, messageId?: string) {
+    // Fast pre-check: skips a wasted transaction attempt on the common
+    // repeat-delivery case. Not the real guarantee (the claim inside the
+    // transaction below is) - just avoids doing the work twice.
+    if (messageId && (await this.inboxMessageModel.exists({ messageId }))) {
+      this.logger.warn(
+        `[${getCorrelationId() ?? '-'}] Message ${messageId} already processed, skipping`,
+      );
+      return;
+    }
+
     const session = await this.connection.startSession();
 
     try {
       await session.withTransaction(async () => {
+        if (messageId) {
+          // Claimed first, inside the transaction: a genuinely failed
+          // attempt further down (e.g. destination wallet not found) rolls
+          // this back together with everything else, so a legitimate
+          // redelivery retry still gets a fair attempt instead of being
+          // permanently "poisoned" by a failed claim.
+          try {
+            await this.inboxMessageModel.create([{ messageId }], { session });
+          } catch (error) {
+            if ((error as { code?: number }).code === 11000) {
+              this.logger.warn(
+                `[${getCorrelationId() ?? '-'}] Message ${messageId} already processed ` +
+                  '(lost the claim race), skipping',
+              );
+              return;
+            }
+            throw error;
+          }
+        }
+
         // Atomic, status-guarded claim: only one execution of this - across
         // redeliveries, duplicate messages, or the sweep worker's republish -
         // will ever see status flip PENDING -> COMPLETED. A null result means

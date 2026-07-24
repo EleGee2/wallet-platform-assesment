@@ -1,9 +1,16 @@
 import { INestApplication, Logger } from '@nestjs/common';
 import { Connection } from 'mongoose';
 import { RabbitMQService } from '../../src/queue/rabbitmq.service';
+import { InboxMessage } from '../../src/queue/schemas/inbox-message.schema';
 import { Transfer } from '../../src/wallets/schemas/transfer.schema';
 import { Wallet } from '../../src/wallets/schemas/wallet.schema';
-import { createAuthenticatedRequest, createTestApp, getModel, resetDatabase } from './test-utils';
+import {
+  createAuthenticatedRequest,
+  createTestApp,
+  flushThrottleState,
+  getModel,
+  resetDatabase,
+} from './test-utils';
 
 async function pollUntil(fn: () => Promise<boolean>, timeoutMs = 8000, intervalMs = 200) {
   const start = Date.now();
@@ -29,6 +36,7 @@ describe('Transfer flow (integration)', () => {
 
   beforeEach(async () => {
     await resetDatabase(connection);
+    await flushThrottleState(app);
     client = await createAuthenticatedRequest(app, connection);
   });
 
@@ -254,5 +262,35 @@ describe('Transfer flow (integration)', () => {
     expect(correlatedLogLines.length).toBeGreaterThan(0);
 
     logSpy.mockRestore();
+  });
+
+  it('claims exactly one inbox message for a real transfer completion', async () => {
+    const transferModel = getModel(app, Transfer.name);
+    const inboxMessageModel = getModel(app, InboxMessage.name);
+
+    const fromWallet = await client
+      .post('/wallets')
+      .send({ userId: 'sender-7', ownerName: 'Kwesi Ampofo' })
+      .expect(201);
+    const toWallet = await client
+      .post('/wallets')
+      .send({ userId: 'receiver-7', ownerName: 'Akosua Nyarko' })
+      .expect(201);
+
+    await client.post(`/wallets/${fromWallet.body._id}/deposit`).send({ amount: 100 }).expect(201);
+
+    const transferResponse = await client
+      .post('/wallets/transfer')
+      .send({ fromWalletId: fromWallet.body._id, toWalletId: toWallet.body._id, amount: 40 })
+      .expect(201);
+
+    const settled = await pollUntil(async () => {
+      const transfer = await transferModel.findById(transferResponse.body._id);
+      return transfer?.status === 'COMPLETED';
+    });
+    expect(settled).toBe(true);
+
+    const inboxMessages = await inboxMessageModel.find({}).exec();
+    expect(inboxMessages).toHaveLength(1);
   });
 });

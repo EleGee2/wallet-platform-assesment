@@ -5,6 +5,7 @@ import { Transaction, TransactionSchema } from '../transactions/schemas/transact
 import { Transfer, TransferSchema } from '../wallets/schemas/transfer.schema';
 import { Wallet, WalletSchema } from '../wallets/schemas/wallet.schema';
 import { RabbitMQService } from './rabbitmq.service';
+import { InboxMessage, InboxMessageSchema } from './schemas/inbox-message.schema';
 import { TransferEventsConsumer } from './transfer-events.consumer';
 
 @Module({
@@ -13,6 +14,7 @@ import { TransferEventsConsumer } from './transfer-events.consumer';
       { name: Transfer.name, schema: TransferSchema },
       { name: Wallet.name, schema: WalletSchema },
       { name: Transaction.name, schema: TransactionSchema },
+      { name: InboxMessage.name, schema: InboxMessageSchema },
     ]),
     LedgerModule,
   ],
