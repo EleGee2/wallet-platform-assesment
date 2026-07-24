@@ -29,7 +29,7 @@ export class OutboxRelayWorker implements OnModuleInit, OnModuleDestroy {
     try {
       const pending = await this.outboxService.findPending(50);
       for (const event of pending) {
-        await this.rabbitMQService.publish(event.routingKey, event.payload);
+        await this.rabbitMQService.publish(event.routingKey, event.payload, event.correlationId);
         await this.outboxService.markPublished(event.id);
       }
     } catch (error) {

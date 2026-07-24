@@ -22,6 +22,13 @@ export class OutboxEvent {
   @Prop()
   publishedAt?: Date;
 
+  // The correlation ID of the HTTP request that staged this event, if any -
+  // carried forward as the AMQP message's own correlationId property when
+  // OutboxRelayWorker publishes it, so a request can be traced into its
+  // downstream consumer.
+  @Prop()
+  correlationId?: string;
+
   createdAt?: Date;
   updatedAt?: Date;
 }
