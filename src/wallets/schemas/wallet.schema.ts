@@ -26,3 +26,5 @@ export class Wallet {
 }
 
 export const WalletSchema = SchemaFactory.createForClass(Wallet);
+
+WalletSchema.index({ updatedAt: -1 });
