@@ -23,22 +23,44 @@ export class RedisService implements OnModuleDestroy {
     return `wallet:balance:${walletId}`;
   }
 
+  // Cache reads/writes degrade gracefully instead of throwing: a Redis outage
+  // should never turn an otherwise-successful Mongo read or write into a
+  // client-facing error - callers just get treated to a cache miss / no-op.
   async getCachedBalance(walletId: string): Promise<number | null> {
-    const value = await this.client.get(this.walletBalanceKey(walletId));
-    return value === null ? null : parseFloat(value);
+    try {
+      const value = await this.client.get(this.walletBalanceKey(walletId));
+      return value === null ? null : parseFloat(value);
+    } catch (error) {
+      this.logger.error(
+        `Failed to read cached balance for wallet ${walletId}: ${(error as Error).message}`,
+      );
+      return null;
+    }
   }
 
   async setCachedBalance(walletId: string, balance: number): Promise<void> {
-    await this.client.set(
-      this.walletBalanceKey(walletId),
-      balance.toString(),
-      'EX',
-      this.ttlSeconds,
-    );
+    try {
+      await this.client.set(
+        this.walletBalanceKey(walletId),
+        balance.toString(),
+        'EX',
+        this.ttlSeconds,
+      );
+    } catch (error) {
+      this.logger.error(
+        `Failed to cache balance for wallet ${walletId}: ${(error as Error).message}`,
+      );
+    }
   }
 
   async invalidateBalance(walletId: string): Promise<void> {
-    await this.client.del(this.walletBalanceKey(walletId));
+    try {
+      await this.client.del(this.walletBalanceKey(walletId));
+    } catch (error) {
+      this.logger.error(
+        `Failed to invalidate cached balance for wallet ${walletId}: ${(error as Error).message}`,
+      );
+    }
   }
 
   getClient(): Redis {
