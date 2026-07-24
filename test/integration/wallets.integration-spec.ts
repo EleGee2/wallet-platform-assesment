@@ -1,6 +1,7 @@
 import { INestApplication } from '@nestjs/common';
 import { Connection } from 'mongoose';
 import { LedgerEntry } from '../../src/ledger/schemas/ledger-entry.schema';
+import { Transaction } from '../../src/transactions/schemas/transaction.schema';
 import { createAuthenticatedRequest, createTestApp, getModel, resetDatabase } from './test-utils';
 
 describe('Wallets (integration)', () => {
@@ -60,5 +61,68 @@ describe('Wallets (integration)', () => {
 
   it('rejects malformed wallet creation payloads', async () => {
     await client.post('/wallets').send({ ownerName: 'Missing userId' }).expect(400);
+  });
+
+  it('reflects a fresh balance on GET /wallets/:id immediately after a deposit', async () => {
+    const wallet = await client
+      .post('/wallets')
+      .send({ userId: 'user-4', ownerName: 'Kwabena Agyei' })
+      .expect(201);
+
+    // Populate the cache with the pre-deposit (zero) balance.
+    const before = await client.get(`/wallets/${wallet.body._id}`).expect(200);
+    expect(before.body.balance).toBe(0);
+
+    await client.post(`/wallets/${wallet.body._id}/deposit`).send({ amount: 150 }).expect(201);
+
+    const after = await client.get(`/wallets/${wallet.body._id}`).expect(200);
+    expect(after.body.balance).toBe(150);
+  });
+
+  it('does not double-credit when the same deposit request is retried with the same reference', async () => {
+    const wallet = await client
+      .post('/wallets')
+      .send({ userId: 'user-5', ownerName: 'Adjoa Sarpong' })
+      .expect(201);
+
+    const body = { amount: 80, reference: 'integration-deposit-key-1' };
+
+    await client.post(`/wallets/${wallet.body._id}/deposit`).send(body).expect(201);
+    await client.post(`/wallets/${wallet.body._id}/deposit`).send(body).expect(409);
+
+    const after = await client.get(`/wallets/${wallet.body._id}`).expect(200);
+    expect(after.body.balance).toBe(80);
+
+    const transactionModel = getModel(app, Transaction.name);
+    const transactionsWithReference = await transactionModel
+      .find({ reference: body.reference })
+      .exec();
+    expect(transactionsWithReference).toHaveLength(1);
+  });
+
+  it('computes correct dashboard totals/count and caps recentActivity at 10 for a wallet with more than 10 transactions', async () => {
+    const wallet = await client
+      .post('/wallets')
+      .send({ userId: 'user-6', ownerName: 'Kojo Amankwah' })
+      .expect(201);
+
+    for (let i = 0; i < 12; i += 1) {
+      await client.post(`/wallets/${wallet.body._id}/deposit`).send({ amount: 100 }).expect(201);
+    }
+    for (let i = 0; i < 3; i += 1) {
+      await client.post(`/wallets/${wallet.body._id}/withdraw`).send({ amount: 50 }).expect(201);
+    }
+
+    const dashboard = await client.get(`/wallets/${wallet.body._id}/dashboard`).expect(200);
+
+    expect(dashboard.body.transactionCount).toBe(15);
+    expect(dashboard.body.totalDeposited).toBe(1200);
+    expect(dashboard.body.totalWithdrawn).toBe(150);
+    expect(dashboard.body.recentActivity).toHaveLength(10);
+    for (const activity of dashboard.body.recentActivity) {
+      expect(activity.transaction).toBeTruthy();
+      expect(Array.isArray(activity.entries)).toBe(true);
+      expect(activity.entries.length).toBeGreaterThan(0);
+    }
   });
 });
